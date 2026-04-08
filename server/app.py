@@ -33,8 +33,8 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from models import PipelineAction, TaskState
-    from my_env_environment import PipelineEnvironment
+    from ..models import PipelineAction, TaskState
+    from .my_env_environment import PipelineEnvironment
 except ModuleNotFoundError:
     from models import PipelineAction, TaskState
     from server.my_env_environment import PipelineEnvironment

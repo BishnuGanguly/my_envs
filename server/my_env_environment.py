@@ -11,8 +11,8 @@ from openenv.core.env_server.types import State
 # from OpenEnv.envs.my_env.tasks import create_tasks_class
 
 try:
-    from models import JobNode, PipelineAction, ResourceState, TaskState
-    from tasks import compute_step_reward
+    from ..models import JobNode, PipelineAction, ResourceState, TaskState
+    from ..tasks import compute_step_reward
 except ImportError:
     from models import JobNode, PipelineAction, ResourceState, TaskState
     from tasks import compute_step_reward
