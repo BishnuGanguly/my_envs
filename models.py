@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
@@ -278,6 +277,22 @@ class TaskState(Observation):
         ),
     )
 
+    # -- SLA ratio metrics (stored in metadata, updated after every action) -
+    # These are NOT fields — they live in metadata dict (inherited from
+    # Observation) so the reward function can read them without polluting
+    # the Pydantic schema.  Access via:
+    #   ts.metadata["sla_success_ratio"]          → float | None
+    #   ts.metadata["critical_sla_success_ratio"] → float | None
+    #
+    # None  = no SLA-due jobs have been observed yet this episode.
+    # float = completed_sla_due / total_sla_due  (both counts cumulative).
+    #
+    # The env also stores the raw counts for transparency:
+    #   ts.metadata["sla_due_total"]              → int
+    #   ts.metadata["sla_due_completed"]          → int
+    #   ts.metadata["critical_sla_due_total"]     → int
+    #   ts.metadata["critical_sla_due_completed"] → int
+
     # -- Agent feedback -----------------------------------------------------
     last_action_feedback: str = Field(
         default="Episode started. Make your first scheduling decision.",
@@ -308,6 +323,64 @@ class TaskState(Observation):
         """Minutes left before time budget runs out."""
         return max(0, self.time_budget - self.current_time)
 
+    def init_sla_metadata(self) -> None:
+        """
+        Initialise SLA ratio metadata keys to their episode-start defaults.
+
+        Call this once inside reset() after the TaskState is constructed.
+        All counts start at 0; ratios start at None (no data yet).
+        """
+        self.metadata["sla_due_total"]              = 0
+        self.metadata["sla_due_completed"]          = 0
+        self.metadata["critical_sla_due_total"]     = 0
+        self.metadata["critical_sla_due_completed"] = 0
+        self.metadata["sla_success_ratio"]          = None
+        self.metadata["critical_sla_success_ratio"] = None
+
+    def update_sla_ratios(self) -> None:
+        """
+        Recompute SLA ratio metadata from the current job list.
+
+        Definition
+        ----------
+        A job is "SLA-due" when its sla_deadline is not None AND <= 0,
+        meaning the deadline has arrived or passed this step.
+
+        sla_success_ratio          = completed SLA-due jobs / all SLA-due jobs
+        critical_sla_success_ratio = completed critical SLA-due / critical SLA-due
+
+        Counts are CUMULATIVE across the episode (jobs can only become
+        SLA-due once), so we scan all jobs each time and overwrite the
+        counts — this is safe because sla_deadline only decreases.
+
+        Both ratios are None until at least one SLA-due job exists.
+        """
+        sla_due_jobs = [
+            j for j in self.jobs
+            if j.sla_deadline is not None and j.sla_deadline <= 0
+        ]
+        completed_ids = {j.id for j in self.jobs if j.status == "done"}
+
+        # -- All SLA-due jobs -----------------------------------------------
+        total     = len(sla_due_jobs)
+        completed = sum(1 for j in sla_due_jobs if j.id in completed_ids)
+
+        self.metadata["sla_due_total"]     = total
+        self.metadata["sla_due_completed"] = completed
+        self.metadata["sla_success_ratio"] = (
+            completed / total if total > 0 else None
+        )
+
+        # -- Critical-path SLA-due jobs only --------------------------------
+        critical_due      = [j for j in sla_due_jobs if j.critical_path]
+        critical_total     = len(critical_due)
+        critical_completed = sum(1 for j in critical_due if j.id in completed_ids)
+
+        self.metadata["critical_sla_due_total"]     = critical_total
+        self.metadata["critical_sla_due_completed"] = critical_completed
+        self.metadata["critical_sla_success_ratio"] = (
+            critical_completed / critical_total if critical_total > 0 else None
+        )
 
 
 class PipelineAction(Action):
@@ -321,5 +394,3 @@ class PipelineAction(Action):
             "to start one or more READY jobs."
         ),
     )
-
-

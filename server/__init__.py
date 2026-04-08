@@ -8,4 +8,4 @@
 
 from .my_env_environment import PipelineEnvironment
 
-__all__ = ["MyEnvironment"]
+__all__ = ["PipelineEnvironment"]

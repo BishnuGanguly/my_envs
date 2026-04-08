@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -13,8 +12,10 @@ from openenv.core.env_server.types import State
 
 try:
     from models import JobNode, PipelineAction, ResourceState, TaskState
+    from tasks import compute_step_reward
 except ImportError:
     from models import JobNode, PipelineAction, ResourceState, TaskState
+    from tasks import compute_step_reward
 
 
 # ---------------------------------------------------------------------------
@@ -112,22 +113,29 @@ class PipelineEnvironment(Environment):
         Builds fresh JobNode / ResourceState / TaskState objects.
         All counters and timers reset to their initial values.
 
+        SLA ratio metadata is initialised to zeros / None here so the
+        reward function always finds the keys present from step 0.
+
         Returns the initial TaskState (first observation the agent sees).
         """
         if kwargs.get("job_blueprints") is not None:
-           self._task_state = self.build_taskstate(kwargs["job_blueprints"])
-           self._task_state.sync_job_lists()
+            self._task_state = self.build_taskstate(kwargs["job_blueprints"])
+            self._task_state.sync_job_lists()
         # else:
         #     tasks_class = create_tasks_class()
         #     self._task_state = tasks_class.tasks[0]
 
+        # Initialise SLA ratio counters to episode-start defaults.
+        # At t=0 no sla_deadline has expired yet, so both ratios are None.
+        self._task_state.init_sla_metadata()
 
         self._reset_rubric()
         self._episode_id = episode_id or str(uuid.uuid4())
         self._step_count = 0
         return self._task_state
 
-  
+    # -----------------------------------------------------------------------
+
     def step(
         self,
         action: PipelineAction,
@@ -182,6 +190,12 @@ class PipelineEnvironment(Environment):
             ts.done = True
 
         ts.sync_job_lists()
+
+        # -- Compute and store per-step reward ------------------------------
+        # update_sla_ratios() was already called inside _handle_wait() or
+        # _handle_schedule(), so metadata ratios are current at this point.
+        ts.reward = compute_step_reward(ts)
+
         return ts
 
     # -----------------------------------------------------------------------
@@ -193,8 +207,8 @@ class PipelineEnvironment(Environment):
             episode_id = self._episode_id,
             step_count = self._step_count,
         )
-    
-    def build_taskstate(self,job_blueprints: List[dict])-> TaskState:
+
+    def build_taskstate(self, job_blueprints: List[dict]) -> TaskState:
         jobs: List[JobNode] = []
         for bp in job_blueprints[1:]:
             status = "ready" if not bp["depends_on"] else "pending"
@@ -295,6 +309,7 @@ class PipelineEnvironment(Environment):
         3. Reduce remaining_time of every running job by step_size.
         4. Complete jobs whose remaining_time reached zero.
         5. Unlock jobs whose dependencies are now all done.
+        6. Recompute SLA ratio metadata (both overall and critical-path).
 
         Returns a human-readable feedback string.
         """
@@ -307,7 +322,6 @@ class PipelineEnvironment(Environment):
         self._reduce_sla_deadlines(T)
 
         # 3: tick running jobs
-        ####what about the deadlines of of non running jobs####
         for job in ts.jobs:
             if job.status == "running":
                 current_remaining = job.metadata.get("time_remaining", job.duration)
@@ -319,11 +333,34 @@ class PipelineEnvironment(Environment):
         # 5: unlock newly unblocked jobs
         unlocked = self._unlock_ready_jobs()
 
+        # 6: recompute SLA ratios now that deadlines have been decremented
+        #    and any newly finished jobs are marked done.
+        ts.update_sla_ratios()
+
         parts = [f"Waited {T} min. Time is now {ts.current_time} min."]
         if finished:
             parts.append(f"Completed: {finished}.")
         if unlocked:
             parts.append(f"Now ready: {unlocked}.")
+
+        # Append SLA ratio info to feedback when data exists
+        sla_ratio = ts.metadata["sla_success_ratio"]
+        if sla_ratio is not None:
+            n_comp  = ts.metadata["sla_due_completed"]
+            n_total = ts.metadata["sla_due_total"]
+            parts.append(
+                f"SLA success ratio: {sla_ratio:.2f} ({n_comp}/{n_total})."
+            )
+
+        critical_ratio = ts.metadata["critical_sla_success_ratio"]
+        if critical_ratio is not None:
+            nc_comp  = ts.metadata["critical_sla_due_completed"]
+            nc_total = ts.metadata["critical_sla_due_total"]
+            parts.append(
+                f"Critical-path SLA success ratio: "
+                f"{critical_ratio:.2f} ({nc_comp}/{nc_total})."
+            )
+
         return " ".join(parts)
 
     # -----------------------------------------------------------------------
@@ -334,19 +371,22 @@ class PipelineEnvironment(Environment):
 
         Full logic when running jobs already exist
         ------------------------------------------
-        1. Validate each requested job_id.
-        2. Find the running job with the smallest remaining_time → T.
-        3. Advance current_time by T.
-        4. Reduce task_deadline and per-job sla_deadlines by T.
-        5. Reduce remaining_time of every other running job by T.
-        6. Complete the earliest-finishing running job (free its resources).
-        7. Unlock any jobs whose deps are now all done.
-        8. Add each validated new job to running with time_remaining = duration - T.
-        9. Deduct each new job's resources from ResourceState.
+        1.  Validate each requested job_id.
+        2.  Find the running job with the smallest remaining_time → T.
+        3.  Advance current_time by T.
+        4.  Reduce task_deadline and per-job sla_deadlines by T.
+        5.  Reduce remaining_time of every other running job by T.
+        6.  Complete the earliest-finishing running job (free its resources).
+        7.  Unlock any jobs whose deps are now all done.
+        8.  Add each validated new job to running with time_remaining = duration.
+        9.  Deduct each new job's resources from ResourceState.
+        10. Recompute SLA ratio metadata (both overall and critical-path).
 
         When no running jobs exist
         --------------------------
         Skip steps 2–6. Just start each job with time_remaining = duration.
+        SLA ratios are still recomputed (step 10) in case a deadline expired
+        at the moment the schedule action fires.
 
         Parameters
         ----------
@@ -388,7 +428,6 @@ class PipelineEnvironment(Environment):
             self._reduce_sla_deadlines(T)
 
             # Reduce remaining time of all other running jobs by T
-            ##what about non running jobs##
             for job in running_nodes:
                 if job.id != earliest.id:
                     current = job.metadata.get("time_remaining", job.duration)
@@ -433,6 +472,28 @@ class PipelineEnvironment(Environment):
 
         if scheduled:
             feedback_parts.append(f"Scheduled: {scheduled}.")
+
+        # -- Recompute SLA ratios after all state changes -------------------
+        # Deadlines were decremented by T above (via _reduce_sla_deadlines),
+        # so any job whose deadline just hit 0 is captured here.
+        ts.update_sla_ratios()
+
+        sla_ratio = ts.metadata["sla_success_ratio"]
+        if sla_ratio is not None:
+            n_comp  = ts.metadata["sla_due_completed"]
+            n_total = ts.metadata["sla_due_total"]
+            feedback_parts.append(
+                f"SLA success ratio: {sla_ratio:.2f} ({n_comp}/{n_total})."
+            )
+
+        critical_ratio = ts.metadata["critical_sla_success_ratio"]
+        if critical_ratio is not None:
+            nc_comp  = ts.metadata["critical_sla_due_completed"]
+            nc_total = ts.metadata["critical_sla_due_total"]
+            feedback_parts.append(
+                f"Critical-path SLA success ratio: "
+                f"{critical_ratio:.2f} ({nc_comp}/{nc_total})."
+            )
 
         return " ".join(feedback_parts) if feedback_parts else "No action taken."
 
@@ -546,8 +607,8 @@ class PipelineEnvironment(Environment):
 
         Handles common LLM output patterns:
         - Clean format:   [wait]  or  [schedule: {id}]
-        - With reasoning: "I will schedule ingest_sales.\\n[schedule: {ingest_sales}]"
-        - Markdown fence: ```\\n[schedule: {id}]\\n```
+        - With reasoning: "I will schedule ingest_sales.\n[schedule: {ingest_sales}]"
+        - Markdown fence: ```\n[schedule: {id}]\n```
 
         Falls back to "[wait]" if nothing valid is found.
         """

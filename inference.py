@@ -21,7 +21,13 @@ STDOUT format (mandatory)
 [STEP]  step=<n> action=<action> reward=<0.00> done=<true|false> error=<msg|null>
 [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
 
-Score = completed_jobs / total_jobs  (0.0 – 1.0)
+Score formula
+-------------
+    score = 0.5 * mean(per_step_rewards) + 0.5 * (jobs_completed / total_jobs)
+
+where per_step_rewards = [compute_step_reward(ts) at each step]
+                       = [0.7 * sla_ratio + 0.3 * critical_ratio] per step
+
 Success = score >= SUCCESS_THRESHOLD
 """
 
@@ -122,10 +128,10 @@ def log_end(
     score: float,
     rewards: List[float],
 ) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    rewards_str = ",".join(f"{r:.4f}" for r in rewards)
     print(
         f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
+        f"score={score:.4f} rewards={rewards_str}",
         flush=True,
     )
 
@@ -177,13 +183,59 @@ def build_user_prompt(obs_dict: dict, step: int) -> str:
     """).strip()
 
 
-def compute_score(obs) -> float:
-    """Score = completed_jobs / total_jobs  (0.0 – 1.0)."""
+def compute_jobs_completion_ratio(obs) -> float:
+    """
+    Jobs-completion ratio = jobs_done / total_jobs.
+
+    This is the second component of the final task score.
+    Range: [0.0, 1.0]
+    """
     total = len(obs.jobs)
     if total == 0:
         return 0.0
     done_count = sum(1 for j in obs.jobs if j.status == "done")
-    return round(done_count / total, 3)
+    return done_count / total
+
+
+def compute_final_score(rewards: List[float], obs) -> float:
+    """
+    Final task score combining reward quality and pipeline completion.
+
+    Formula
+    -------
+        score = 0.5 * mean(per_step_rewards) + 0.5 * (jobs_done / total_jobs)
+
+    Rationale for each term
+    -----------------------
+    mean(per_step_rewards):
+        Captures HOW WELL the agent respected SLA deadlines throughout the
+        episode. An agent that completes all jobs but misses every SLA scores
+        poorly here. An agent that finishes fast with no violations scores ~1.0.
+        We use mean (not sum) here because the per-step reward is already
+        bounded in [0, 1] and we want this term to stay in [0, 1] regardless
+        of episode length — making it directly combinable with the ratio term.
+
+    jobs_done / total_jobs:
+        Captures WHETHER the agent completed the pipeline at all. This anchors
+        the score against agents that earn good SLA ratios by doing nothing
+        (since no-deadline = no violation). Without this term, an agent that
+        never schedules a single job could earn 1.0 on SLA ratios.
+
+    The 50/50 weighting means both dimensions matter equally: a perfect SLA
+    score with 50% completion = 0.75, same as perfect completion with 50% SLA.
+
+    Range: [0.0, 1.0]
+    """
+    if not rewards:
+        mean_reward = 0.0
+    else:
+        mean_reward = sum(rewards) / len(rewards)
+
+    completion_ratio = compute_jobs_completion_ratio(obs)
+
+    raw = 0.5 * mean_reward + 0.5 * completion_ratio
+    # Clamp strictly to [0.01, 0.99] — same range as step rewards.
+    return round(max(0.01, min(0.99, raw)), 4)
 
 # ---------------------------------------------------------------------------
 # LLM call
@@ -228,9 +280,8 @@ async def run_episode(
     task_name : str
         Human-readable task name used in [START] log line.
     Job_blueprint : dict
-        Pre-built job blueprint from tasks.py.
-        Passed to env.reset(job_blueprint=Job_blueprint) so the environment
-        loads this DAG instead of the default blueprint.
+        Job blueprint list from tasks.py (the full list[dict] for one task).
+        Passed to env.reset(job_blueprints=Job_blueprint).
     """
     # -- Connect --------------------------------------------------------
     if IMAGE_NAME:
@@ -248,9 +299,7 @@ async def run_episode(
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # -- Reset with the task-specific state --------------------------
-        # The environment's reset() checks kwargs["job_blueprint"] and uses
-        # it directly instead of rebuilding from the default blueprints.
+        # -- Reset with the task-specific blueprint ----------------------
         result = await env.reset(job_blueprints=Job_blueprint)
         last_obs = result.observation
 
@@ -266,9 +315,11 @@ async def run_episode(
             action = PipelineAction(message=raw_action)
             result = await env.step(action)
 
-            reward      = result.reward or 0.0
-            done        = result.done
-            last_obs    = result.observation
+            # reward is set by compute_step_reward() inside environment.step()
+            # and stored on ts.reward before the TaskState is returned.
+            reward   = result.reward if result.reward is not None else 0.0
+            done     = result.done
+            last_obs = result.observation
 
             rewards.append(reward)
             steps_taken = step
@@ -278,9 +329,9 @@ async def run_episode(
             if done:
                 break
 
-        # -- Score -------------------------------------------------------
+        # -- Final score -------------------------------------------------
         if last_obs is not None:
-            score = compute_score(last_obs)
+            score = compute_final_score(rewards, last_obs)
         success = score >= SUCCESS_THRESHOLD
 
     finally:
@@ -299,18 +350,17 @@ async def main() -> None:
     """
     Entry point.
 
-    1. Build all 3 JobBlueprint objects from tasks.py.
-    2. Run each as a separate episode, emitting START / STEP / END lines.
+    Runs all 3 task blueprints (easy → medium → difficult) as separate
+    episodes, emitting START / STEP / END log lines for each.
     """
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # Build the 3 job blueprints: [easy, medium, difficult]
     all_tasks = create_tasks_class.JOB_BLUEPRINT_LIST
 
     for task_name, job_blueprint in zip(TASK_NAMES, all_tasks):
         await run_episode(
-            client     = client,
-            task_name  = task_name,
+            client        = client,
+            task_name     = task_name,
             Job_blueprint = job_blueprint,
         )
 

@@ -1,6 +1,6 @@
 ---
-title: My Env Environment Server
-emoji: 🎧
+title: ETL Pipeline Scheduling Environment
+emoji: 🔧
 colorFrom: blue
 colorTo: indigo
 sdk: docker
@@ -11,245 +11,193 @@ tags:
   - openenv
 ---
 
-# My Env Environment
+# ETL Pipeline Scheduler: Operational AI Benchmark
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+The ETL Pipeline Scheduling Environment is an OpenEnv-compliant benchmark designed to test whether LLM agents can reason about **time, resources, and dependencies simultaneously** — the core challenge of real-world data engineering operations.
 
-## Quick Start
+An agent observes a live Directed Acyclic Graph (DAG) of interdependent ETL jobs. Each job has a duration, a CPU cost, upstream dependencies, and an optional SLA deadline. The agent must decide which jobs to start and when to wait, all under a shared pool of workers and CPU slots. Greedy agents fail. Agents that can reason about critical paths, resource contention windows, and multi-horizon deadlines succeed.
 
-The simplest way to use the My Env environment is through the `MyEnv` class:
+---
 
-```python
-from my_env import MyAction, MyEnv
+## Motivation
 
-try:
-    # Create environment from Docker image
-    my_envenv = MyEnv.from_docker_image("my_env-env:latest")
+Production data pipelines fail in subtle ways that expose gaps in LLM operational reasoning:
 
-    # Reset
-    result = my_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
+1. **Dependency-aware scheduling**: A job can only start when all its upstream dependencies are complete. Agents that ignore the DAG structure block themselves immediately.
+2. **Resource contention**: Multiple jobs compete for a shared CPU pool. Scheduling a low-priority job at the wrong moment can starve a critical-path job of the resources it needs, causing a cascade of SLA failures.
+3. **Deadline horizon reasoning**: SLA deadlines count from episode start, not from when a job becomes schedulable. An agent must work backwards from deadlines to decide *now* what to schedule *next*.
+4. **Resisting temptation**: Some jobs are ready to schedule but harmful to schedule — because they consume resources needed by higher-priority jobs arriving soon. The agent must learn to say no.
 
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
+---
 
-    for msg in messages:
-        result = my_envenv.step(MyAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
+## Environment Specification
 
-finally:
-    # Always clean up
-    my_envenv.close()
+### Observation Space
+
+Each step the agent receives a structured JSON state object containing:
+
+| Field | Description |
+| :--- | :--- |
+| `current_time_minutes` | Simulated minutes elapsed since episode start |
+| `task_deadline_minutes` | Minutes remaining until the final pipeline SLA |
+| `resources` | `workers_free`, `workers_total`, `cpu_free`, `cpu_total` |
+| `ready_jobs` | List of job IDs that can be scheduled right now |
+| `running_jobs` | List of `[job_id, minutes_remaining]` pairs |
+| `completed_jobs` | List of finished job IDs |
+| `jobs` | Full metadata for every job: `duration`, `cpu_required`, `depends_on`, `sla_deadline`, `critical_path` |
+| `edges` | All DAG dependency edges as `(parent_id, child_id)` pairs |
+| `critical_path` | Subset of edges on the critical path to the final deadline |
+| `last_feedback` | Plain-English result of the previous action |
+
+### Action Space
+
+The agent responds with exactly one of the following per step:
+
+| Action | Effect |
+| :--- | :--- |
+| `[wait]` | Advance simulation time by 5 minutes; running jobs tick forward |
+| `[schedule: {job_id}]` | Start a single READY job (if resources allow) |
+| `[schedule: {job_id_1, job_id_2}]` | Start multiple READY jobs in one action |
+
+A job can only be scheduled if `workers_free >= 1` **and** `cpu_free >= job.cpu_required`. Batching multiple jobs into one schedule action is more efficient than issuing separate actions.
+
+---
+
+## Tasks and Difficulty
+
+| Task | Difficulty | Jobs | Workers | CPU | Time Budget | Key Challenge |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| `pipeline_easy` | **Easy** | 3 | 2 | 4 | 60 min | Zero slack — act on step 1 or miss the SLA |
+| `pipeline_medium` | **Medium** | 6 | 3 | 6 | 120 min | CPU trap job that starves the critical path |
+| `pipeline_difficult` | **Hard** | 10 | 4 | 8 | 180 min | Two large jobs that cannot run simultaneously |
+
+### `pipeline_easy` — Zero-Slack Linear Chain
+
+A three-job sequential pipeline: `ingest_customers → clean_customers → build_report`. All jobs run on the same single critical path. `clean_customers` carries an SLA deadline at **t=40 min**. Since `ingest_customers` takes 10 minutes, the agent must schedule it on step 1 with no waiting. Any idle step at the start causes the SLA to expire. Tests immediate critical-path recognition and the understanding that SLA deadlines are absolute, not relative.
+
+```
+ingest_customers (10 min) → clean_customers (10 min, SLA=40) → build_report (10 min, SLA=60)
 ```
 
-That's it! The `MyEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
+### `pipeline_medium` — The CPU Trap
 
-## Building the Docker Image
+Two parallel ingest streams converge at `compute_revenue`. A third job, `ingest_logs`, is ready at t=0 with no dependencies — but it consumes 3 of 6 available CPU slots. If the agent schedules it, `clean_sales` (also requiring 3 CPU) cannot start when `ingest_sales` finishes, causing `clean_sales` to breach its SLA at t=50, which cascades into `compute_revenue` (SLA=90) and `summary_report` (SLA=110). The agent must identify and defer the trap job while parallelising the two safe ingest streams.
 
-Before using the environment, you need to build the Docker image:
+```
+ingest_sales (15 min, 2 CPU) → clean_sales (15 min, 2 CPU, SLA=50) ──┐
+ingest_events (12 min, 1 CPU) → clean_events (10 min, 1 CPU)         ├→ compute_revenue (20 min, 3 CPU, SLA=90) → summary_report (10 min, SLA=110)
+ingest_logs [TRAP] (20 min, 3 CPU) ─────────────────── off-path ─────┘
+```
+
+### `pipeline_difficult` — Double Diamond with a Time Bomb
+
+Two overlapping diamond-shaped dependency chains share a single terminal bottleneck (`daily_summary`). The central challenge is that `compute_revenue` (3 CPU, SLA=100) and `anomaly_detection` (3 CPU, SLA=130) together require 6 CPU but only 8 are available — they cannot run simultaneously alongside other active jobs and must be sequenced in deadline order. An additional temptation job (`enrich_reference`, no dependencies, 2 CPU) must be scheduled in a precise window: too early it starves the first clean wave; too late it delays `anomaly_detection` past its SLA. Requires genuine multi-horizon deadline reasoning across 4 workers.
+
+```
+ingest_sales (20 min) → clean_sales (15 min, SLA=70) ────────────────────────────────────────────┐
+ingest_events (15 min) → clean_events (10 min) ──┬──→ compute_revenue (20 min, 3 CPU, SLA=100) ──┤
+ingest_inventory (12 min) → clean_inventory ─────┤                                               ├→ daily_summary (12 min, SLA=150)
+enrich_reference [window job] (18 min, 2 CPU) ───┴──→ compute_metrics (18 min) → anomaly_detection (25 min, 3 CPU, SLA=130) ──┘
+```
+
+---
+
+## Scoring
+
+### Per-Step Reward
+
+At every step, the environment computes:
+
+```
+step_reward = clamp(0.7 × sla_success_ratio + 0.3 × critical_sla_success_ratio, 0.01, 0.99)
+```
+
+| Term | Definition |
+| :--- | :--- |
+| `sla_success_ratio` | `(SLA-due jobs completed on time) / (all SLA-due jobs)` |
+| `critical_sla_success_ratio` | `(critical-path SLA-due jobs completed) / (critical-path SLA-due jobs)` |
+
+Both ratios default to **1.0** when no SLA deadlines have yet expired — the agent starts with full credit and loses it as deadlines pass with incomplete jobs.
+
+### Final Task Score
+
+```
+task_score = clamp(0.5 × mean(step_rewards) + 0.5 × (jobs_completed / total_jobs), 0.01, 0.99)
+```
+
+The two terms measure complementary things: `mean(step_rewards)` captures *how well* SLAs were respected throughout the episode; `jobs_completed / total_jobs` captures *whether* the pipeline was actually finished. An agent that completes the pipeline but misses every SLA, and an agent that respects every SLA but never finishes the pipeline, both score around 0.5.
+
+**Success threshold: 0.80**
+
+---
+
+## Baseline Benchmarks
+
+Evaluated across all 3 tasks. Scores represent Final Task Score [0.01 – 0.99].
+
+| Model | `pipeline_easy` | `pipeline_medium` | `pipeline_difficult` | Success Rate |
+| :--- | :---: | :---: | :---: | :---: |
+| *Results to be published post-evaluation* | — | — | — | — |
+
+---
+
+## Setup and Usage
+
+### 1. Installation
 
 ```bash
-# From project root
-docker build -t my_env-env:latest -f server/Dockerfile .
+uv sync
 ```
 
-## Deploying to Hugging Face Spaces
-
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
+### 2. Environment Configuration
 
 ```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
+cp .env.example .env
+# Set HF_TOKEN, MODEL_NAME, API_BASE_URL as needed
 ```
 
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
-
-### Prerequisites
-
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
-
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
+### 3. Run the Server
 
 ```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
+uv run server
 ```
 
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**MyAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**MyObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a My Env environment server running, you can connect directly:
-
-```python
-from my_env import MyEnv
-
-# Connect to existing server
-my_envenv = MyEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = my_envenv.reset()
-result = my_envenv.step(MyAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `my_envenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from my_env import MyAction, MyEnv
-
-# Connect with context manager (auto-connects and closes)
-with MyEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(MyAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    MyEnvironment,  # Pass class, not instance
-    MyAction,
-    MyObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then multiple clients can connect simultaneously:
-
-```python
-from my_env import MyAction, MyEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with MyEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(MyAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
+### 4. Run the Benchmark
 
 ```bash
-# From the server directory
-python3 server/my_env_environment.py
+python inference.py
 ```
 
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
+### Environment Variables
 
-### Running Locally
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `API_BASE_URL` | `https://router.huggingface.co/v1` | LLM API endpoint |
+| `MODEL_NAME` | `Qwen/Qwen2.5-72B-Instruct` | Model identifier |
+| `HF_TOKEN` | — | HuggingFace API key |
+| `LOCAL_IMAGE_NAME` | — | Docker image name (optional) |
+| `ENV_BASE_URL` | `http://localhost:8000` | Server URL when not using Docker |
 
-Run the server locally for development:
-
-```bash
-uvicorn server.app:app --reload
-```
+---
 
 ## Project Structure
 
 ```
-my_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # MyEnv client
-├── models.py              # Action and Observation models
-└── server/
-    ├── __init__.py        # Server module exports
-    ├── my_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+pipeline_env/
+├── environment.py   # Core simulation: DAG execution, resource tracking, time advancement
+├── models.py        # Pydantic schemas: JobNode, TaskState, ResourceState, PipelineAction
+├── tasks.py         # Task blueprints (easy/medium/difficult) + reward function
+├── inference.py     # Benchmark execution: runs all 3 tasks, emits START/STEP/END logs
+├── client.py        # OpenEnv async client
+└── openenv.yaml     # Environment manifest
 ```
+
+---
+
+## Key Design Decisions
+
+**Event-driven time advancement**: The `[schedule]` action does not cost a full time step. Instead, time advances exactly to the moment when the earliest running job finishes, making scheduling decisions effectively free in terms of simulated time. Only `[wait]` burns a fixed 5-minute block. This means the agent is rewarded for parallelism and penalised for unnecessary waiting.
+
+**SLA deadlines are absolute**: All `sla_deadline` values in job definitions count from `t=0` (episode start), not from when the job becomes schedulable. This forces the agent to reason about the full DAG timeline upfront rather than reacting greedily step-by-step.
+
+**Separate `time_budget` and `task_deadline`**: `time_budget` is the hard episode termination limit. `task_deadline` is the SLA for the final pipeline job. `task_deadline < time_budget` in medium and hard tasks, meaning the agent has buffer time but no SLA buffer — finishing late is not the same as finishing on time.
