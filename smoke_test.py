@@ -47,9 +47,9 @@ def run_direct_environment_smoke_test() -> PipelineEnvironment:
     This is the fastest way to verify reset/step/state transitions.
     """
     env = PipelineEnvironment()
-
+    #job_blueprints=create_tasks_class.JOB_BLUEPRINT_LIST[0]
     # 1) reset
-    state = env.reset(job_blueprints=create_tasks_class.JOB_BLUEPRINT_LIST[0])
+    state = env.reset()
     print_state("INITIAL STATE AFTER RESET", state)
     assert_basic_invariants(state)
 
@@ -128,4 +128,4 @@ if __name__ == "__main__":
     run_direct_environment_smoke_test()
 
     # Uncomment this only after your server is running locally.
-    asyncio.run(run_http_client_smoke_test())
+    #asyncio.run(run_http_client_smoke_test())

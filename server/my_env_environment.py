@@ -13,9 +13,11 @@ from openenv.core.env_server.types import State
 try:
     from models import JobNode, PipelineAction, ResourceState, TaskState
     from tasks import compute_step_reward
+    from tasks import create_tasks_class
 except ImportError:
     from models import JobNode, PipelineAction, ResourceState, TaskState
     from tasks import compute_step_reward
+    from tasks import create_tasks_class
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,9 @@ class PipelineEnvironment(Environment):
 
         Returns the initial TaskState (first observation the agent sees).
         """
+        if kwargs.get("job_blueprints") is None:
+            self._task_state = self.build_taskstate(create_tasks_class.JOB_BLUEPRINT_LIST[0])
+            self._task_state.sync_job_lists
         if kwargs.get("job_blueprints") is not None:
             self._task_state = self.build_taskstate(kwargs["job_blueprints"])
             self._task_state.sync_job_lists()
